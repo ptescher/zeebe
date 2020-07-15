@@ -102,7 +102,6 @@ public final class ZeebePartition extends Actor
   private ZeebeDb zeebeDb;
   private final String actorName;
   private FailureListener failureListener;
-  private volatile HealthStatus healthStatus = HealthStatus.UNHEALTHY;
   private final HealthMonitor criticalComponentsHealthMonitor;
   private final ZeebeIndexMapping zeebeIndexMapping;
   private final HealthMetrics healthMetrics;
@@ -112,6 +111,7 @@ public final class ZeebePartition extends Actor
   private long term;
   private final String raftPartitionName;
   private StreamProcessor streamProcessor;
+  private final ZeebePartitionHealth zeebePartitionHealth;
 
   public ZeebePartition(
       final BrokerInfo localBroker,
@@ -154,6 +154,7 @@ public final class ZeebePartition extends Actor
     raftPartitionHealth = new RaftPartitionHealth(atomixRaftPartition, actor, this::onRaftFailed);
     healthMetrics = new HealthMetrics(partitionId);
     healthMetrics.setUnhealthy();
+    zeebePartitionHealth = new ZeebePartitionHealth(partitionId);
   }
 
   /**
@@ -665,16 +666,19 @@ public final class ZeebePartition extends Actor
     atomixLogStorage = AtomixLogStorage.ofPartition(zeebeIndexMapping, atomixRaftPartition);
     atomixRaftPartition.getServer().addCommitListener(this);
     atomixRaftPartition.addRoleChangeListener(this);
+    criticalComponentsHealthMonitor.addFailureListener(this);
     onRoleChange(atomixRaftPartition.getRole(), atomixRaftPartition.term());
-    onRecoveredInternal();
   }
 
   @Override
   protected void onActorStarted() {
     criticalComponentsHealthMonitor.startMonitoring();
-    criticalComponentsHealthMonitor.addFailureListener(this);
-
     criticalComponentsHealthMonitor.registerComponent(raftPartitionName, raftPartitionHealth);
+    // Add a component that keep track of health of ZeebePartition. This way
+    // criticalComponentsHealthMonitor can monitor the health of ZeebePartition similar to other
+    // components.
+    criticalComponentsHealthMonitor.registerComponent(
+        zeebePartitionHealth.getName(), zeebePartitionHealth);
   }
 
   @Override
@@ -727,12 +731,12 @@ public final class ZeebePartition extends Actor
 
   @Override
   public void onFailure() {
-    actor.run(() -> updateHealthStatus(HealthStatus.UNHEALTHY));
+    actor.run(() -> notifyFailureListenerAndUpdateMetrics(HealthStatus.UNHEALTHY));
   }
 
   @Override
   public void onRecovered() {
-    actor.run(this::onRecoveredInternal);
+    actor.run(() -> notifyFailureListenerAndUpdateMetrics(HealthStatus.HEALTHY));
   }
 
   private void onInstallFailure() {
@@ -748,43 +752,36 @@ public final class ZeebePartition extends Actor
   }
 
   private void updateHealthStatus(final HealthStatus newStatus) {
-    if (healthStatus != newStatus) {
-      healthStatus = newStatus;
-      switch (newStatus) {
-        case HEALTHY:
-          healthMetrics.setHealthy();
-          if (failureListener != null) {
-            failureListener.onRecovered();
-          }
-          break;
-        case UNHEALTHY:
-          healthMetrics.setUnhealthy();
-          if (failureListener != null) {
-            failureListener.onFailure();
-          }
-          break;
-        default:
-          LOG.warn("Unknown health status {}", newStatus);
-          break;
-      }
-    }
+    zeebePartitionHealth.setHealthStatus(newStatus);
   }
 
   @Override
   public HealthStatus getHealthStatus() {
-    if (healthStatus == HealthStatus.UNHEALTHY) {
-      return HealthStatus.UNHEALTHY;
-    }
-    final var componentsHealthStatus = criticalComponentsHealthMonitor.getHealthStatus();
-    if (componentsHealthStatus == HealthStatus.UNHEALTHY) {
-      updateHealthStatus(HealthStatus.UNHEALTHY);
-    }
-    return componentsHealthStatus;
+    return criticalComponentsHealthMonitor.getHealthStatus();
   }
 
   @Override
   public void addFailureListener(final FailureListener failureListener) {
     actor.run(() -> this.failureListener = failureListener);
+  }
+
+  private void notifyFailureListenerAndUpdateMetrics(final HealthStatus healthStatus) {
+    switch (healthStatus) {
+      case HEALTHY:
+        if (failureListener != null) {
+          failureListener.onRecovered();
+        }
+        healthMetrics.setHealthy();
+        break;
+      case UNHEALTHY:
+        if (failureListener != null) {
+          failureListener.onFailure();
+        }
+        healthMetrics.setUnhealthy();
+        break;
+      default:
+        LOG.warn("Unknown health status {}", healthStatus);
+    }
   }
 
   @Override
