@@ -108,10 +108,9 @@ public final class ZeebePartition extends Actor
   private AtomixLogStorage atomixLogStorage;
   private long deferredCommitPosition;
   private final RaftPartitionHealth raftPartitionHealth;
-  private long term;
-  private final String raftPartitionName;
-  private StreamProcessor streamProcessor;
   private final ZeebePartitionHealth zeebePartitionHealth;
+  private long term;
+  private StreamProcessor streamProcessor;
 
   public ZeebePartition(
       final BrokerInfo localBroker,
@@ -131,7 +130,6 @@ public final class ZeebePartition extends Actor
     this.commandApiService = commandApiService;
     this.partitionListeners = Collections.unmodifiableList(partitionListeners);
     this.partitionId = atomixRaftPartition.id().id();
-    this.raftPartitionName = "Raft-" + partitionId;
     this.scheduler = actorScheduler;
     this.maxFragmentSize = (int) brokerCfg.getNetwork().getMaxMessageSizeInBytes();
     this.zeebeIndexMapping = zeebeIndexMapping;
@@ -152,9 +150,9 @@ public final class ZeebePartition extends Actor
     this.actorName = buildActorName(localBroker.getNodeId(), "ZeebePartition-" + partitionId);
     criticalComponentsHealthMonitor = new CriticalComponentsHealthMonitor(actor, LOG);
     raftPartitionHealth = new RaftPartitionHealth(atomixRaftPartition, actor, this::onRaftFailed);
+    zeebePartitionHealth = new ZeebePartitionHealth(partitionId);
     healthMetrics = new HealthMetrics(partitionId);
     healthMetrics.setUnhealthy();
-    zeebePartitionHealth = new ZeebePartitionHealth(partitionId);
   }
 
   /**
@@ -250,7 +248,7 @@ public final class ZeebePartition extends Actor
   }
 
   private void transitionToInactive(final CompletableActorFuture<Void> transitionComplete) {
-    updateHealthStatus(HealthStatus.UNHEALTHY);
+    zeebePartitionHealth.setHealthStatus(HealthStatus.UNHEALTHY);
     closePartition()
         .onComplete(
             (nothing, error) -> {
@@ -673,7 +671,8 @@ public final class ZeebePartition extends Actor
   @Override
   protected void onActorStarted() {
     criticalComponentsHealthMonitor.startMonitoring();
-    criticalComponentsHealthMonitor.registerComponent(raftPartitionName, raftPartitionHealth);
+    criticalComponentsHealthMonitor.registerComponent(
+        raftPartitionHealth.getName(), raftPartitionHealth);
     // Add a component that keep track of health of ZeebePartition. This way
     // criticalComponentsHealthMonitor can monitor the health of ZeebePartition similar to other
     // components.
@@ -683,7 +682,7 @@ public final class ZeebePartition extends Actor
 
   @Override
   protected void onActorClosed() {
-    criticalComponentsHealthMonitor.removeComponent(raftPartitionName);
+    criticalComponentsHealthMonitor.removeComponent(raftPartitionHealth.getName());
     raftPartitionHealth.close();
   }
 
@@ -731,16 +730,28 @@ public final class ZeebePartition extends Actor
 
   @Override
   public void onFailure() {
-    actor.run(() -> notifyFailureListenerAndUpdateMetrics(HealthStatus.UNHEALTHY));
+    actor.run(
+        () -> {
+          healthMetrics.setUnhealthy();
+          if (failureListener != null) {
+            failureListener.onFailure();
+          }
+        });
   }
 
   @Override
   public void onRecovered() {
-    actor.run(() -> notifyFailureListenerAndUpdateMetrics(HealthStatus.HEALTHY));
+    actor.run(
+        () -> {
+          healthMetrics.setHealthy();
+          if (failureListener != null) {
+            failureListener.onRecovered();
+          }
+        });
   }
 
   private void onInstallFailure() {
-    updateHealthStatus(HealthStatus.UNHEALTHY);
+    zeebePartitionHealth.setHealthStatus(HealthStatus.UNHEALTHY);
     if (atomixRaftPartition.getRole() == Role.LEADER) {
       LOG.info("Unexpected failures occurred when installing leader services, stepping down");
       atomixRaftPartition.stepDown();
@@ -748,11 +759,7 @@ public final class ZeebePartition extends Actor
   }
 
   private void onRecoveredInternal() {
-    updateHealthStatus(HealthStatus.HEALTHY);
-  }
-
-  private void updateHealthStatus(final HealthStatus newStatus) {
-    zeebePartitionHealth.setHealthStatus(newStatus);
+    zeebePartitionHealth.setHealthStatus(HealthStatus.HEALTHY);
   }
 
   @Override
@@ -763,25 +770,6 @@ public final class ZeebePartition extends Actor
   @Override
   public void addFailureListener(final FailureListener failureListener) {
     actor.run(() -> this.failureListener = failureListener);
-  }
-
-  private void notifyFailureListenerAndUpdateMetrics(final HealthStatus healthStatus) {
-    switch (healthStatus) {
-      case HEALTHY:
-        if (failureListener != null) {
-          failureListener.onRecovered();
-        }
-        healthMetrics.setHealthy();
-        break;
-      case UNHEALTHY:
-        if (failureListener != null) {
-          failureListener.onFailure();
-        }
-        healthMetrics.setUnhealthy();
-        break;
-      default:
-        LOG.warn("Unknown health status {}", healthStatus);
-    }
   }
 
   @Override
