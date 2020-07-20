@@ -90,9 +90,7 @@ public class EmbeddedBrokerRule extends ExternalResource {
       final Supplier<InputStream> configSupplier,
       final int timeout,
       final Consumer<BrokerCfg>... configurators) {
-    this.configSupplier = configSupplier;
-    this.configurators = configurators;
-    this.timeout = Duration.ofSeconds(timeout);
+    this(configSupplier, Duration.ofSeconds(timeout), configurators);
   }
 
   @SafeVarargs
@@ -103,6 +101,21 @@ public class EmbeddedBrokerRule extends ExternalResource {
     this.configSupplier = configSupplier;
     this.configurators = configurators;
     this.timeout = timeout;
+
+    if (brokerCfg == null) {
+      try (final InputStream configStream = configSupplier.get()) {
+        if (configStream == null) {
+          brokerCfg = new BrokerCfg();
+        } else {
+          brokerCfg =
+              new TestConfigurationFactory()
+                  .create(null, "zeebe.broker", configStream, BrokerCfg.class);
+        }
+        configureBroker(brokerCfg);
+      } catch (final IOException e) {
+        throw new RuntimeException("Unable to open configuration", e);
+      }
+    }
   }
 
   private static void deleteSnapshots(final File parentDir) {
@@ -196,21 +209,6 @@ public class EmbeddedBrokerRule extends ExternalResource {
   }
 
   public void startBroker() {
-    if (brokerCfg == null) {
-      try (final InputStream configStream = configSupplier.get()) {
-        if (configStream == null) {
-          brokerCfg = new BrokerCfg();
-        } else {
-          brokerCfg =
-              new TestConfigurationFactory()
-                  .create(null, "zeebe.broker", configStream, BrokerCfg.class);
-        }
-        configureBroker(brokerCfg);
-      } catch (final IOException e) {
-        throw new RuntimeException("Unable to open configuration", e);
-      }
-    }
-
     broker =
         new Broker(
             brokerCfg,
